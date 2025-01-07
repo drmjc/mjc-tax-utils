@@ -5,7 +5,7 @@ import sys
 import re
 
 """
-This script extracts the items data from Bunnings invoices (PDF) into a spreadsheet, to assist with tax returns.
+This script extracts the transactions data from Bunnings invoices (PDF) into a spreadsheet, to assist with tax returns.
 
 1. login to your Powerpass account (https://trade.bunnings.com.au/powerpass)
 2. select 1 or more invoices to download into a PDF file(s). Save these all in one folder
@@ -14,9 +14,9 @@ This script extracts the items data from Bunnings invoices (PDF) into a spreadsh
     python3 -m venv path/to/venv
     source path/to/venv/bin/activate
     python3 -m pip install PyPDF2
-5. run `python3 parse_bunnings.py "my bunnings invoices.pdf"`
+5. run `python3 parse_bunnings_transactions.py "my bunnings invoices.pdf"`
 6. if you have lots of PDF files, then run the script on all of the PDF files in a given folder:
-    `for pdf in *pdf; do python3 parse_bunnings.py "${pdf}"; done`
+    `for pdf in *pdf; do python3 parse_bunnings_transactions.py "${pdf}"; done`
 
 # output
 It creates a CSV file with the same name as the PDF file (s/pdf/csv/) and with the same headings as the items table in the PDF file. 
@@ -64,11 +64,14 @@ def add_space_after_seventh_char(s):
         return s[:7] + ' ' + s[7:]
     return s
 
+def get_store(s):
+    return "Bunnings " + s.replace(' Warehouse', '')
+
 def extract_table_from_pdf(pdf_path):
     # Automatically name the output CSV file based on the input PDF file name
     csv_path = os.path.splitext(pdf_path)[0] + '.csv'
     
-    headings = ["Invoice Date", "Item", "Quantity", "Unit", "Description", "Your Price", "Discount", "Amount ex GST", "GST", "Total Price"]
+    headings = ["Invoice Date", "Store", "Item", "Quantity", "Unit", "Description", "Your Price", "Discount", "Amount ex GST", "GST", "Total Price", "Business", "Deductable (%)", "Deductable ($)"]
     # Open the PDF file
     with open(pdf_path, 'rb') as pdf_file:
         reader = PyPDF2.PdfReader(pdf_file)
@@ -97,6 +100,9 @@ def extract_table_from_pdf(pdf_path):
                     print(f"Skipping page: is a refund/tax adjustment")
                     break
 
+                if 'warehouse' in line.lower():
+                    store = get_store(line)
+                    
                 line = replace_EACH(line)
                 line = replace_PROMO(line)
 
@@ -123,6 +129,7 @@ def extract_table_from_pdf(pdf_path):
                         # craete a Description by joining all the middle columns
                         row = columns[:3] + [' '.join(columns[3:-5])] + columns[-5:]
                         if invoice_date:
+                            row.insert(0, store)  # Insert store as the second column
                             row.insert(0, invoice_date)  # Insert invoice date as the first column
                         table_rows.append(row)
                 i += 1
