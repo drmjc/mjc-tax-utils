@@ -10,11 +10,11 @@
 # This script likely works well for any file that has the data in DD/MM/YYYY format in column 1.
 #
 # Usage
-# ./combine_bunnings.sh bunnings_transaction_report_fy2021.csv bunnings_transaction_report_fy2022.csv bunnings_transaction_report_fy2023.csv
-# ./combine_bunnings.sh bunnings*part*csv
+# ./combine_bunnings_transactions.sh bunnings_transaction_report_fy2021.csv bunnings_transaction_report_fy2022.csv bunnings_transaction_report_fy2023.csv
+# ./combine_bunnings_transactions.sh bunnings*part*csv
 #
 # This is usually step 2 in a pipeline of processing transaction data
-# for pdf in *pdf; do python3 ./parse_bunnings_transactions_transactions.py "${pdf}"; done
+# for pdf in *pdf; do python3 parse_bunnings_transactions.py "${pdf}"; done
 # ./combine_bunnings_transactions.sh bunnings*part*csv
 # ./split_by_financial_year.sh bunnings_transaction_report.csv
 #
@@ -32,24 +32,15 @@ if [ "$#" -lt 1 ]; then
     exit 1
 fi
 
-output_file="bunnings_transaction_report.csv"
-header_written=false
-
-# Create or clear the output file
-> "$output_file"
-
 tmp=$(mktemp)
 # Iterate over each input CSV file
 for input_file in "$@"; do
-    if [ "$header_written" = false ]; then
-        # Write the header from the first file
-        head -n 1 "$input_file" > "$output_file"
-        header_written=true
-    fi
     # Append the contents of the file, skipping the header
     tail -n +2 "$input_file" >> "$tmp"
 done
 
+output_file="bunnings_transaction_report.csv"
+head -n 1 "$1" > "$output_file"
 sort -t, -k1.7,1.10n -k1.4,1.5n -k1.1,1.2n -k6,6 "$tmp" >> "$output_file"
 rm $tmp
 
