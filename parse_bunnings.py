@@ -67,7 +67,6 @@ def add_space_after_seventh_char(s):
 def extract_table_from_pdf(pdf_path):
     # Automatically name the output CSV file based on the input PDF file name
     csv_path = os.path.splitext(pdf_path)[0] + '.csv'
-    debug = False
     
     headings = ["Invoice Date", "Item", "Quantity", "Unit", "Description", "Your Price", "Discount", "Amount ex GST", "GST", "Total Price"]
     # Open the PDF file
@@ -101,9 +100,6 @@ def extract_table_from_pdf(pdf_path):
                 line = replace_EACH(line)
                 line = replace_PROMO(line)
 
-                if 'PK88809' in line:
-                    debug = True
-
                 if 'EACH' in line:
                     columns = line.split()  # Split on spaces
                     
@@ -117,16 +113,8 @@ def extract_table_from_pdf(pdf_path):
                             columns = line.split()
                             i += 1  # Skip the next line as it has been concatenated
                     
-                    # Print the number of columns for each matching line
-                    if debug:
-                        print(f"Number of columns: {len(columns)}")
-                    
                     # Ensure there are at least 9 columns
                     if len(columns) >= 1:
-                        if debug:
-                            for elem in columns:
-                                print(f'"{elem}"')
-                            print(' '.join(columns[3:-5]))
                         # Replace "NETT" with "0%" in the 4th last column
                         if len(columns) >= 4 and columns[-4] in ["NETT", "PROMO"]:
                             columns[-4] = "0%"
@@ -137,7 +125,6 @@ def extract_table_from_pdf(pdf_path):
                         if invoice_date:
                             row.insert(0, invoice_date)  # Insert invoice date as the first column
                         table_rows.append(row)
-                    debug = False
                 i += 1
     
     # Write the table rows to a CSV file
