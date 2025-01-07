@@ -13,9 +13,9 @@
 # ./split_by_financial_year.sh bunnings_transaction_report.csv
 #
 # This is usually step 3 in a pipeline of processing transaction data
-# for pdf in *pdf; do python3 ./parse_bunnings_transactions.py "${pdf}"; done
-# ./combine_bunnings.sh bunnings*part*csv
-# rm *fy202?.csv  #needed if this is not the first time running the script.
+# for pdf in *pdf; do python3 parse_bunnings_transactions.py "${pdf}"; done
+# ./combine_bunnings_transactions.sh bunnings*part*csv
+# rm bunnings_transaction_report_fy202?.csv # needed if this is not the first time running the script.
 # ./split_by_financial_year.sh bunnings_transaction_report.csv
 #
 # Output
