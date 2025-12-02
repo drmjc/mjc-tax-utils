@@ -36,6 +36,7 @@ import re
 import sys
 import fitz  # PyMuPDF
 import json
+from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
 
@@ -52,8 +53,11 @@ DEBUG = "--debug" in sys.argv
 # Based on comparison with actual AliExpress charges
 EXCHANGE_RATE_SCALE_FACTOR = 1.0165  # ~1.65% increase
 
-# Exchange rate cache file
-CACHE_FILE = "exchange_rate_cache.json"
+# Script directory
+SCRIPT_DIR = os.path.dirname(__file__)
+
+# Exchange rate cache file (stored next to this script)
+CACHE_FILE = os.path.join(SCRIPT_DIR, "exchange_rate_cache.json")
 
 # Load existing cache if available
 if os.path.exists(CACHE_FILE):
@@ -69,21 +73,52 @@ def log_debug(message):
     if DEBUG:
         print(f"[DEBUG] {message}")
 
-def get_exchange_rate(date_str, currency):
+def get_exchange_rate(date_str, currency, return_date=False):
     """Fetch historical exchange rate to AUD for given currency and date, with caching."""
     if not currency or currency == "AUD":
         return 1.0
     
-    # Check cache first
+    # Normalize date string
+    try:
+        # Expecting YYYY-MM-DD
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else None
+    except Exception:
+        date_obj = None
+
+    # Check cache first for exact date
     cache_key = f"{date_str}_{currency}"
     if cache_key in exchange_rate_cache:
         cached_rate = exchange_rate_cache[cache_key]
         log_debug(f"Exchange rate for {currency} on {date_str}: {cached_rate} (from cache)")
-        return cached_rate
+        return (cached_rate, date_str) if return_date else cached_rate
+
+    # If no exact cached rate, look for a nearby cached rate for the currency
+    nearest_cached_rate = None
+    nearest_cached_date = None
+    if date_obj:
+        best_diff = None
+        for key, value in exchange_rate_cache.items():
+            if not key.endswith(f"_{currency}"):
+                continue
+            # key format: YYYY-MM-DD_CURRENCY
+            try:
+                k_date_str = key.split("_")[0]
+                k_date = datetime.strptime(k_date_str, "%Y-%m-%d")
+                diff = abs((k_date - date_obj).days)
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    nearest_cached_rate = value
+                    nearest_cached_date = k_date_str
+            except Exception:
+                continue
+        if nearest_cached_rate is not None:
+            log_debug(f"No exact exchange rate cached for {currency} on {date_str}; using nearest cached {nearest_cached_date} rate {nearest_cached_rate}")
+            return (nearest_cached_rate, nearest_cached_date) if return_date else nearest_cached_rate
     
     # Use exchangerate.host convert API with access key
     # Convert 1 unit to get the exchange rate
     url = f"https://api.exchangerate.host/convert?from={currency}&to=AUD&date={date_str}&amount=1&access_key={ACCESS_KEY}"
+    # Try API call for the exact date first
     try:
         response = requests.get(url)
         if response.status_code == 200:
@@ -96,21 +131,61 @@ def get_exchange_rate(date_str, currency):
                 # Cache the result
                 exchange_rate_cache[cache_key] = rate
                 log_debug(f"Exchange rate for {currency} on {date_str}: {rate} (scaled by {EXCHANGE_RATE_SCALE_FACTOR}, cached)")
-                return rate
+                return (rate, date_str) if return_date else rate
             else:
                 log_debug(f"Exchange rate API returned success=false: {data}")
     except Exception as e:
         log_debug(f"Exchange rate fetch failed: {e}")
     
-    # Fallback: return 1.0 if API fails
+    # If the API failed for the exact date, try surrounding dates (up to 7 days) to find a usable rate
+    if date_obj:
+        for offset in range(1, 8):
+            for sign in (1, -1):
+                try_date = (date_obj + timedelta(days=sign * offset)).strftime("%Y-%m-%d")
+                try_key = f"{try_date}_{currency}"
+                # First use any cached nearby date
+                if try_key in exchange_rate_cache:
+                    cached_rate = exchange_rate_cache[try_key]
+                    log_debug(f"Using cached rate for {currency} on {try_date} (nearest to requested {date_str}): {cached_rate}")
+                    return (cached_rate, try_date) if return_date else cached_rate
+                # Otherwise try API for that date
+                url2 = f"https://api.exchangerate.host/convert?from={currency}&to=AUD&date={try_date}&amount=1&access_key={ACCESS_KEY}"
+                try:
+                    resp2 = requests.get(url2)
+                    if resp2.status_code == 200:
+                        data2 = resp2.json()
+                        if data2.get("success", False):
+                            rate2 = data2.get("result", 1.0) * EXCHANGE_RATE_SCALE_FACTOR
+                            exchange_rate_cache[try_key] = rate2
+                            log_debug(f"Exchange rate for {currency} on {try_date}: {rate2} (from API fallback, cached)")
+                            return (rate2, try_date) if return_date else rate2
+                except Exception as e:
+                    log_debug(f"Exchange rate fetch failed for fallback date {try_date}: {e}")
+
+    # Try to use any existing cached rate for this currency (most recent)
+    last_cached_rate = None
+    last_cached_date = None
+    for key, value in exchange_rate_cache.items():
+        if not key.endswith(f"_{currency}"):
+            continue
+        k_date_str = key.split("_")[0]
+        if last_cached_date is None or k_date_str > last_cached_date:
+            last_cached_date = k_date_str
+            last_cached_rate = value
+    if last_cached_rate is not None:
+        log_debug(f"Using most recent cached rate for {currency} (date {last_cached_date}): {last_cached_rate}")
+        return (last_cached_rate, last_cached_date) if return_date else last_cached_rate
+
+    # As a final resort, fallback to 1.0 and log a warning
     log_debug(f"Using fallback exchange rate of 1.0 for {currency}")
-    return 1.0
+    return (1.0, None) if return_date else 1.0
 
 def clean_description(lines):
-    """Combine English-like lines into a single description."""
+    """Combine lines into a single description, allowing alphanumeric, unicode, and common punctuation."""
     description_parts = []
     for line in lines:
-        if re.match(r"^[A-Za-z0-9 ,.&'/-]+$", line.strip()):
+        # Allow letters, digits, unicode characters, and common punctuation including parentheses and quotes
+        if re.match(r"^[\w\s,.&'/()\[\]\"-]+$", line.strip(), re.UNICODE):
             description_parts.append(line.strip())
         else:
             break
@@ -226,6 +301,8 @@ def extract_invoice_data(pdf_path):
             break
     
     rows = []
+    # Track exchange rates used during parsing (key: date_currency, value: rate)
+    used_exchange_rates = {}
     if items_start_idx > 0 and currency:
         i = items_start_idx
         while i < len(lines):
@@ -256,7 +333,7 @@ def extract_invoice_data(pdf_path):
                 if "total amount" in line_stripped.lower():
                     break
                 # Include if it looks like description text
-                if re.match(r"^[A-Za-z0-9 ,.&'/-]+$", line_stripped):
+                if re.match(r"^[\w\s,.&'/()\[\]\"-]+$", line_stripped, re.UNICODE):
                     desc_lines.append(line_stripped)
                 else:
                     break
@@ -287,8 +364,12 @@ def extract_invoice_data(pdf_path):
                         # Verify GST rate line has %
                         if "%" in lines[j + 2]:
                             price = float(lines[j + 4])
-                            rate = get_exchange_rate(invoice_date, currency)
+                            rate, rate_date = get_exchange_rate(invoice_date, currency, return_date=True)
+                            if not rate_date:
+                                rate_date = invoice_date
+                            used_exchange_rates[f"{rate_date}_{currency}"] = rate
                             price_aud = round(price * rate, 2)
+                            log_debug(f"Item parsed: desc='{description}' qty={quantity} price={price} {currency} -> {price_aud} AUD using rate={rate}")
                             
                             rows.append({
                                 "Invoice Date": invoice_date,
@@ -312,46 +393,17 @@ def extract_invoice_data(pdf_path):
                     i += 1
             else:
                 i += 1
-    else:
-        # Fallback: try original method
-        i = 0
-        while i < len(lines):
-            if lines[i].lower().startswith("item name"):
-                desc_lines = []
-                j = i + 1
-                while j < len(lines) and "price inclusive of gst" not in lines[j].lower():
-                    desc_lines.append(lines[j])
-                    j += 1
-                description = clean_description(desc_lines)
-
-                if j < len(lines) and "price inclusive of gst" in lines[j].lower():
-                    if j + 2 < len(lines):
-                        currency = lines[j + 1].strip("()")
-                        try:
-                            price = float(lines[j + 2])
-                        except ValueError:
-                            price = 0.0
-                        rate = get_exchange_rate(invoice_date, currency)
-                        price_aud = round(price * rate, 2)
-
-                        rows.append({
-                            "Invoice Date": invoice_date,
-                            "Invoice Number": invoice_number,
-                            "Shop": "AliExpress",
-                            "Branch": supplier_name,
-                            "Description": description,
-                            "Quantity": quantity,
-                            "Original Currency": currency,
-                            "Item Cost": price,
-                            "Item Cost (AUD)": price_aud
-                        })
-                i = j + 3
-            else:
-                i += 1
+    # NOTE: Removed fallback parsing method (duplicate logic). If invoice parsing using the
+    # main 'items_start_idx' detection fails, the invoice format likely doesn't match the
+    # expected structure. Consider adding more robust parsing or explicit patterns for
+    # edge-case invoices rather than maintaining two near-duplicate parsing branches.
 
     # Pro-rate delivery fee across items
     if delivery_fee and delivery_currency and rows:
-        delivery_rate = get_exchange_rate(invoice_date, delivery_currency)
+        delivery_rate, delivery_rate_date = get_exchange_rate(invoice_date, delivery_currency, return_date=True)
+        if not delivery_rate_date:
+            delivery_rate_date = invoice_date
+        used_exchange_rates[f"{delivery_rate_date}_{delivery_currency}"] = delivery_rate
         delivery_fee_aud = round(delivery_fee * delivery_rate, 2)
         num_items = len(rows)
         prorated_delivery_aud = delivery_fee_aud / num_items
@@ -404,7 +456,10 @@ def extract_invoice_data(pdf_path):
     
     # Add delivery fee summary if present
     if delivery_fee and delivery_currency:
-        delivery_rate = get_exchange_rate(invoice_date, delivery_currency)
+        delivery_rate, delivery_rate_date = get_exchange_rate(invoice_date, delivery_currency, return_date=True)
+        if not delivery_rate_date:
+            delivery_rate_date = invoice_date
+        used_exchange_rates[f"{delivery_rate_date}_{delivery_currency}"] = delivery_rate
         delivery_fee_aud = round(delivery_fee * delivery_rate, 2)
         result["delivery_fee"] = {
             "amount": delivery_fee,
@@ -412,6 +467,9 @@ def extract_invoice_data(pdf_path):
             "amount_aud": delivery_fee_aud,
             "prorated_across_items": len(rows)
         }
+    # Add a summary of exchange rates used
+    if used_exchange_rates:
+        result["exchange_rates"] = used_exchange_rates
     
     return result
 
@@ -430,6 +488,17 @@ if __name__ == "__main__":
 
     # Print to stdout
     print(json_output)
+
+    # Print a summary of exchange rates used
+    if 'exchange_rates' in data:
+        print("\nExchange rates used:")
+        for key, rate in data['exchange_rates'].items():
+            try:
+                date_str, currency_str = key.split("_")
+            except ValueError:
+                date_str = key
+                currency_str = "?"
+            print(f"  {currency_str} on {date_str}: {rate:.3f}")
 
     # Save to file
     json_file = os.path.splitext(pdf_path)[0] + ".json"
