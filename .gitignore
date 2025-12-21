@@ -4,3 +4,5 @@ __pycache__
 venv
 exchange_rate_cache.json
 .vscode/settings.json
+cba/test/*.tsv
+cba/test/2021-06-30 - 06 2799 12930092 - Statement20210630.pdf
