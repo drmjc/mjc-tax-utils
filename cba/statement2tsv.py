@@ -75,9 +75,9 @@ def extract_account_number(pdf_path: str) -> str:
         text = first_page.get_text()
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         
-        # Pattern 1: Look for "Account Number" followed by the number
+        # Pattern 1: Look for "Account Number" followed by the number (same line or next line)
         account_re = re.compile(r'(?i)account\s+number[:\s]+([\d\s-]{6,})')
-        for line in lines:
+        for i, line in enumerate(lines):
             match = account_re.search(line)
             if match:
                 account_num = match.group(1).strip()
@@ -86,6 +86,15 @@ def extract_account_number(pdf_path: str) -> str:
                 if len(account_num) >= 6:  # Minimum reasonable length
                     doc.close()
                     return account_num
+            # Also check if this line is "Account number" and next line has digits
+            if re.match(r'(?i)^account\s+number\s*:?\s*$', line) and i+1 < len(lines):
+                next_line = lines[i+1].strip()
+                # Check if next line is just digits (possibly with spaces/dashes)
+                if re.match(r'^[\d\s-]{6,}$', next_line):
+                    account_num = re.sub(r'\s+', ' ', next_line).strip()
+                    if len(account_num.replace(' ', '').replace('-', '')) >= 6:
+                        doc.close()
+                        return account_num
         
         # Pattern 2: Look for digit patterns that match CBA account format (e.g., "06 2799 12930092")
         # CBA accounts typically have format: 2 digits, space, 4 digits, space, 8 digits
@@ -163,7 +172,7 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
         if col_centers is None:
             for l_i, spans in enumerate(pls):
                 joined = ' '.join(s['text'] for s in spans).lower()
-                if ('date' in joined and 'transaction' in joined):
+                if ('date' in joined and ('transaction' in joined or 'transaction description' in joined)):
                     # prefer header lines that start with 'date' or have multiple spans or are followed by Debit/Credit/Balance
                     has_table_labels = False
                     for j in range(l_i+1, min(len(pls), l_i+6)):
@@ -284,11 +293,32 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
             kind = trans_kind
             if not kind:
                 desc = (row[0] + ' ' + row[1]).lower()
-                # Check debit keywords first (more specific patterns like "transfer to")
-                if any(kw in desc for kw in ('transfer to', 'payment', 'purchase', 'withdrawal', 'bpay', 'afterpay', 'loan repayment')):
-                    kind = 'debit'
-                elif any(kw in desc for kw in ('credit', 'direct credit', 'transfer from', 'received', 'refund', 'offer', 'homeseeker', 'salary', 'reversal', 'return')):
+                # Check most specific credit patterns first (to avoid false matches)
+                if any(kw in desc for kw in ('direct credit', 'transfer in', 'transfer from')):
                     kind = 'credit'
+                # "Repayment/Payment" on loan accounts is a credit (reduces loan balance)
+                elif 'repayment/payment' in desc:
+                    kind = 'credit'
+                # "Reversal" and "Return" are credits that override debit patterns (e.g., "Reversal ... Transfer To..." or "Return ... Loan Repayment...")
+                elif 'reversal' in desc or 'return' in desc:
+                    kind = 'credit'
+                # Then check specific debit patterns (including BPAY, which should take precedence over "credit card")
+                elif any(kw in desc for kw in ('transfer to', 'loan repayment', 'bpay')):
+                    kind = 'debit'
+                # Then check other credit patterns (but exclude "credit card" - that's not a credit transaction)
+                elif any(kw in desc for kw in ('received', 'refund', 'offer', 'homeseeker', 'salary', 'bonus interest', 'interest')):
+                    kind = 'credit'
+                # Check for "credit" but only if it's not part of "credit card"
+                elif 'credit' in desc and 'credit card' not in desc:
+                    kind = 'credit'
+                # Finally check generic debit patterns (but avoid matching "payment" in "RENT PAYMENT" when it's part of a credit)
+                elif any(kw in desc for kw in ('payment', 'purchase', 'withdrawal', 'afterpay')):
+                    # Only match if it's not part of "direct credit" or other credit indicators
+                    if 'direct credit' not in desc and 'transfer in' not in desc:
+                        kind = 'debit'
+                # "credit card" transactions are debits (payments)
+                elif 'credit card' in desc:
+                    kind = 'debit'
             if kind == 'credit':
                 if not row[3]:
                     row[3] = trans_amt
@@ -304,6 +334,21 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
         # Skip pages before the header page
         if p_i < header_page_idx:
             continue
+        
+        # Debug: print table elements on the third page (page index 2)
+        if debug and p_i == 2:
+            print(f'\n=== PAGE {p_i+1} TABLE ELEMENTS ===', file=sys.stderr)
+            for l_i, spans in enumerate(pls):
+                cols = [''] * (len(col_centers))
+                for s in spans:
+                    idx = assign_span_to_col(s)
+                    if cols[idx]:
+                        cols[idx] += ' ' + s['text']
+                    else:
+                        cols[idx] = s['text']
+                if any(c.strip() for c in cols):
+                    print(f'  Line {l_i}: {cols}', file=sys.stderr)
+            print(f'=== END PAGE {p_i+1} ===\n', file=sys.stderr)
             
         for l_i, spans in enumerate(pls):
             # skip everything before header line on the header page
@@ -316,8 +361,8 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                 # Skip repeated header lines on subsequent pages (Date Transaction or similar)
                 # Check within first 10 lines for header-like content
                 if l_i < 10:
-                    if (joined.strip() == 'date transaction' or 
-                        (joined.lstrip().lower().startswith('date') and 'transaction' in joined and len(joined.strip()) < 60)):
+                    if (joined.strip() in ('date transaction', 'date transaction description') or 
+                        (joined.lstrip().lower().startswith('date') and ('transaction' in joined or 'transaction description' in joined) and len(joined.strip()) < 60)):
                         if debug:
                             print(f'Skipping repeated header on page {p_i} line {l_i}: {joined[:50]}', file=sys.stderr)
                         continue
@@ -355,6 +400,15 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                 # shift remaining for easier handling
                 cols = [date_txt] + cols[2:]
                 is_date = True
+
+            # Check for "closing balance" in any column before processing
+            # Normalize spaces to handle cases like "2019  closing  balance" (double spaces)
+            all_cols_text = re.sub(r'\s+', ' ', ' '.join(c.lower() for c in cols if c).strip())
+            if 'closing balance' in all_cols_text:
+                stopped = True
+                if debug:
+                    print(f'Stopping: found "closing balance" in columns: {cols}', file=sys.stderr)
+                break
 
             if is_date:
                 # finalize previous current row
@@ -403,6 +457,41 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                     # trailing numeric values
                     tx_parts.append(strip_amount_tokens(cols[1].strip()))
                 transaction = ' '.join(tx_parts).strip()
+                
+                # Check for transactions to skip or stop processing
+                # Check both the date and transaction fields for "closing balance"
+                # Normalize spaces to handle cases like "2019  closing  balance" (double spaces)
+                date_lower = re.sub(r'\s+', ' ', (date.lower() if date else '').strip())
+                trans_lower = re.sub(r'\s+', ' ', transaction.lower().strip())
+                if 'closing balance' in date_lower or 'closing balance' in trans_lower:
+                    stopped = True
+                    if debug:
+                        print(f'Stopping: found "closing balance" in date="{date}" or transaction="{transaction}"', file=sys.stderr)
+                    break
+                if any(skip_term in trans_lower for skip_term in [
+                    'interest rate as of',
+                    'interest rate applied to',
+                    'opening balance',
+                    'change in interest rate'
+                ]):
+                    if debug:
+                        print(f'Skipping transaction: {transaction}', file=sys.stderr)
+                    continue
+                # Skip informational messages that are not real transactions
+                if any(skip_term in trans_lower for skip_term in [
+                    'we have processed',
+                    'we confirm',
+                    'we have sent',
+                    'this includes changes',
+                    'effective as at',
+                    'required monthly repayment',
+                    'loan term',
+                    'direct debit repayment amount'
+                ]):
+                    if debug:
+                        print(f'Skipping informational message: {transaction}', file=sys.stderr)
+                    continue
+                
                 debit = cols[2].strip() if len(cols) > 2 else ''
                 credit = cols[3].strip() if len(cols) > 3 else ''
                 balance = cols[4].strip() if len(cols) > 4 else ''
@@ -432,6 +521,37 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                             print(f'Skipping metadata line: {desc_piece[:50]}', file=sys.stderr)
                         continue
                     current[1] = (current[1] + ' ' + desc_piece).strip()
+                    # Check if the merged transaction should be skipped
+                    trans_lower = re.sub(r'\s+', ' ', current[1].lower().strip())
+                    if any(skip_term in trans_lower for skip_term in [
+                        'interest rate as of',
+                        'interest rate applied to',
+                        'opening balance',
+                        'change in interest rate'
+                    ]):
+                        if debug:
+                            print(f'Skipping transaction after merge: {current[1]}', file=sys.stderr)
+                        # Clear current so we don't add it to rows
+                        current = None
+                        current_tokens = []
+                        continue
+                    # Skip informational messages that are not real transactions
+                    if any(skip_term in trans_lower for skip_term in [
+                        'we have processed',
+                        'we confirm',
+                        'we have sent',
+                        'this includes changes',
+                        'effective as at',
+                        'required monthly repayment',
+                        'loan term',
+                        'direct debit repayment amount'
+                    ]):
+                        if debug:
+                            print(f'Skipping informational message after merge: {current[1]}', file=sys.stderr)
+                        # Clear current so we don't add it to rows
+                        current = None
+                        current_tokens = []
+                        continue
                 # merge numeric columns into current amounts
                 for col_idx in (2, 3, 4):
                     if len(cols) > col_idx and cols[col_idx].strip():
@@ -452,6 +572,32 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
             break
 
     # append any final current row
+    if current is not None:
+        # Final check before appending - transaction might have been fully built
+        trans_lower = re.sub(r'\s+', ' ', (current[1].lower() if current[1] else '').strip())
+        if any(skip_term in trans_lower for skip_term in [
+            'interest rate as of',
+            'interest rate applied to',
+            'opening balance',
+            'change in interest rate'
+        ]):
+            if debug:
+                print(f'Skipping final transaction: {current[1]}', file=sys.stderr)
+            current = None
+        # Skip informational messages that are not real transactions
+        elif any(skip_term in trans_lower for skip_term in [
+            'we have processed',
+            'we confirm',
+            'we have sent',
+            'this includes changes',
+            'effective as at',
+            'required monthly repayment',
+            'loan term',
+            'direct debit repayment amount'
+        ]):
+            if debug:
+                print(f'Skipping final informational message: {current[1]}', file=sys.stderr)
+            current = None
     if current is not None:
         # apply any collected tokens for the final row, then sanitize amounts
         current = apply_tokens_to_row(current, current_tokens)
@@ -476,12 +622,12 @@ def find_table_start(lines: List[str]) -> int:
         c = lines[idx+2].lower()
         d = lines[idx+3].lower()
         # common layout: "Date Transaction" then "Debit" "Credit" "Balance"
-        if 'date' in a and 'transaction' in a and 'debit' in b and 'credit' in c and 'balance' in d:
+        if 'date' in a and ('transaction' in a or 'transaction description' in a) and 'debit' in b and 'credit' in c and 'balance' in d:
             return idx + 4
     # also accept single-line header
     for idx, line in enumerate(lines):
         low = line.lower()
-        if 'date' in low and 'transaction' in low and 'debit' in low and 'credit' in low and 'balance' in low:
+        if 'date' in low and ('transaction' in low or 'transaction description' in low) and 'debit' in low and 'credit' in low and 'balance' in low:
             return idx + 1
     return 0
 
@@ -546,16 +692,18 @@ def split_page_sections(pages_lines: List[List[str]]):
         # normalize
         lines = [ln.rstrip() for ln in pl]
         body_start = None
-        # search for a line that contains both 'date' and 'transaction'
+        # search for a line that contains both 'date' and 'transaction' (or 'transaction description')
         for i, ln in enumerate(lines):
             low = ln.lower()
-            if 'date' in low and 'transaction' in low:
+            if 'date' in low and ('transaction' in low or 'transaction description' in low):
                 body_start = i
                 break
-        # if not found, look for 'Date' followed by 'Transaction' on next few lines
+        # if not found, look for 'Date' followed by 'Transaction' (or 'Transaction Description') on next few lines
         if body_start is None:
             for i in range(len(lines)-2):
-                if 'date' in lines[i].lower() and 'transaction' in lines[i+1].lower():
+                low_i = lines[i].lower()
+                low_i1 = lines[i+1].lower()
+                if 'date' in low_i and ('transaction' in low_i1 or 'transaction description' in low_i1):
                     body_start = i
                     break
         # fallback: if page contains 'Date Transaction' string separated, try fuzzy match
@@ -579,7 +727,7 @@ def split_page_sections(pages_lines: List[List[str]]):
         k = 0
         if body:
             bl0 = body[0].lower()
-            if 'date' in bl0 and 'transaction' in bl0:
+            if 'date' in bl0 and ('transaction' in bl0 or 'transaction description' in bl0):
                 k = 1
                 # optionally skip the next three header lines if they exist
                 for j in range(1, 4):
@@ -690,23 +838,65 @@ def parse_statement_lines(lines: List[str]) -> List[List[str]]:
     if not date_indices:
         return rows
 
-    credit_kw = ['transfer from', 'direct credit', 'credit', 'received', 'refund', 'transfer in', 'salary', 'reversal', 'return']
-    debit_kw = ['transfer to', 'payment', 'purchase', 'card', 'withdrawal', 'bpay', 'afterpay', 'loan repayment']
+    # Order matters: more specific patterns first
+    # Note: "credit" is handled separately to exclude "credit card"
+    credit_kw = ['direct credit', 'transfer in', 'transfer from', 'received', 'refund', 'salary', 'reversal', 'return']
+    debit_kw = ['transfer to', 'loan repayment', 'bpay', 'payment', 'purchase', 'card', 'withdrawal', 'afterpay']
+
+    # Track current year and detect year transitions (e.g., Dec 2018 -> Jan 2019)
+    month_map = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'sept': 9, 'oct': 10, 'nov': 11, 'dec': 12
+    }
+    current_year = stmt_year
+    last_month = None  # Track last month number seen (1-12)
 
     for i, start_idx in enumerate(date_indices):
         end_idx = date_indices[i+1] if i+1 < len(date_indices) else len(lines)
         block = [lines[j].strip() for j in range(start_idx, end_idx) if lines[j].strip()]
         if not block:
             continue
-        # Stop if we encounter "closing balance"
-        merged_block = ' '.join(block).lower()
+        # Stop if we encounter "closing balance" anywhere in the block (including date)
+        # Normalize spaces to handle cases like "2019  closing  balance" (double spaces)
+        merged_block = re.sub(r'\s+', ' ', ' '.join(block).lower().strip())
         if 'closing balance' in merged_block:
             break
         first = block[0]
+        # Also check the first line (which contains the date) for "closing balance"
+        first_normalized = re.sub(r'\s+', ' ', first.lower().strip())
+        if 'closing balance' in first_normalized:
+            break
         m = DATE_RE.match(first)
         date = m.group(1) if m else ''
-        if date and re.match(r'^\d{1,2}\s+[A-Za-z]{3}$', date) and stmt_year:
-            date = f"{date} {stmt_year}"
+        
+        # Handle dates without years - detect year transitions
+        if date and re.match(r'^\d{1,2}\s+[A-Za-z]{3}$', date) and current_year:
+            # Extract month from date
+            date_parts = date.split()
+            if len(date_parts) >= 2:
+                mon_str = date_parts[1].lower()
+                month_num = month_map.get(mon_str[:3])
+                if month_num is not None:
+                    # Detect year transition: if current month < last month, we've rolled over
+                    # (e.g., last_month=12 (Dec), current month=1 (Jan) means year increased)
+                    if last_month is not None and month_num < last_month:
+                        current_year = current_year + 1
+                    last_month = month_num
+            date = f"{date} {current_year}"
+        elif date and re.match(r'^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$', date):
+            # Date already has year - update current_year and last_month
+            date_parts = date.split()
+            if len(date_parts) >= 3:
+                try:
+                    year = int(date_parts[2])
+                    if year != current_year:
+                        current_year = year
+                    mon_str = date_parts[1].lower()
+                    month_num = month_map.get(mon_str[:3])
+                    if month_num is not None:
+                        last_month = month_num
+                except Exception:
+                    pass
 
         remainder = first[m.end():].strip() if m else first
         # strip any monetary tokens that may be on the same line as the date so
@@ -725,6 +915,10 @@ def parse_statement_lines(lines: List[str]) -> List[List[str]]:
         for ln in block[1:]:
             if re.search(r'\bCR\b|\bDR\b', ln, flags=re.I) or re.search(r'\$\s*\d', ln):
                 amount_lines.append(ln)
+            # Skip lines that are just amounts (e.g., "- 439.20" or "439.20")
+            elif re.match(r'^[\s\-$]*\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s*$', ln.strip()):
+                # This is an amount line, skip it from description
+                continue
             elif re.search(r'Value Date', ln, flags=re.I) or re.search(r'Card xx', ln, flags=re.I):
                 desc_parts.append(ln)
             else:
@@ -747,15 +941,70 @@ def parse_statement_lines(lines: List[str]) -> List[List[str]]:
             credit = amt_vals[1]
         elif len(amt_vals) == 1:
             desc_text = ' '.join(desc_parts).lower()
-            # Check debit keywords first (more specific patterns like "transfer to")
-            if any(kw in desc_text for kw in debit_kw):
-                debit = amt_vals[0]
-            elif any(kw in desc_text for kw in credit_kw):
+            # Check most specific credit patterns first (to avoid false matches)
+            if any(kw in desc_text for kw in ['direct credit', 'transfer in', 'transfer from']):
                 credit = amt_vals[0]
+            # "Repayment/Payment" on loan accounts is a credit (reduces loan balance)
+            elif 'repayment/payment' in desc_text:
+                credit = amt_vals[0]
+            # "Reversal" and "Return" are credits that override debit patterns (e.g., "Reversal ... Transfer To..." or "Return ... Loan Repayment...")
+            elif 'reversal' in desc_text or 'return' in desc_text:
+                credit = amt_vals[0]
+            # Then check specific debit patterns (including BPAY, which should take precedence over "credit card")
+            elif any(kw in desc_text for kw in ['transfer to', 'loan repayment', 'bpay']):
+                debit = amt_vals[0]
+            # Then check other credit patterns (but exclude "credit card" - that's not a credit transaction)
+            elif any(kw in desc_text for kw in ['received', 'refund', 'offer', 'homeseeker', 'salary', 'bonus interest', 'interest']):
+                credit = amt_vals[0]
+            # Check for "credit" but only if it's not part of "credit card"
+            elif 'credit' in desc_text and 'credit card' not in desc_text:
+                credit = amt_vals[0]
+            # Finally check generic debit patterns (but avoid matching "payment" in "RENT PAYMENT" when it's part of a credit)
+            elif any(kw in desc_text for kw in ['payment', 'purchase', 'withdrawal', 'afterpay']):
+                # Only match if it's not part of "direct credit" or other credit indicators
+                if 'direct credit' not in desc_text and 'transfer in' not in desc_text:
+                    debit = amt_vals[0]
+                else:
+                    credit = amt_vals[0]
+            # "credit card" transactions are debits (payments)
+            elif 'credit card' in desc_text:
+                debit = amt_vals[0]
             else:
                 debit = amt_vals[0]
 
         trans = ' '.join(desc_parts).strip()
+        
+        # Skip transactions with empty or meaningless descriptions (e.g., just "$")
+        if not trans or trans.strip() in ('$', '-', '--'):
+            continue
+        
+        # Check for transactions to skip or stop processing
+        # Check both the date and transaction fields for "closing balance"
+        # Normalize spaces to handle cases like "2019  closing  balance" (double spaces)
+        date_lower = re.sub(r'\s+', ' ', (date.lower() if date else '').strip())
+        trans_lower = re.sub(r'\s+', ' ', trans.lower().strip())
+        if 'closing balance' in date_lower or 'closing balance' in trans_lower:
+            break
+        if any(skip_term in trans_lower for skip_term in [
+            'interest rate as of',
+            'interest rate applied to',
+            'opening balance',
+            'change in interest rate'
+        ]):
+            continue
+        # Skip informational messages that are not real transactions
+        if any(skip_term in trans_lower for skip_term in [
+            'we have processed',
+            'we confirm',
+            'we have sent',
+            'this includes changes',
+            'effective as at',
+            'required monthly repayment',
+            'loan term',
+            'direct debit repayment amount'
+        ]):
+            continue
+        
         rows.append([date, trans, debit, credit, bal])
 
     return rows
@@ -818,14 +1067,27 @@ def main():
                 if stop_lower in low and stop_extra in low:
                     stopped = True
                     break
-                # also stop if the line starts with 'opening balance' (looser)
-                if low.strip().startswith('opening balance'):
-                    stopped = True
-                    break
-                # stop when we encounter "closing balance"
+                # Don't stop on "opening balance" alone - it might be a transaction description
+                # Only stop if it's clearly a summary line (contains both "opening balance" and "total debits")
+                # The transaction parsers will handle skipping "opening balance" transactions
+                # stop when we encounter "closing balance" - but only if it looks like a transaction
+                # (starts with a date pattern or is clearly a transaction row, not just footer text)
                 if 'closing balance' in low:
-                    stopped = True
-                    break
+                    # Check if this looks like a transaction (starts with date pattern)
+                    # or if it's clearly a transaction description (not just footer text)
+                    ln_stripped = ln.strip()
+                    # If it starts with a date pattern (DD MMM or DD/MM), it's likely a transaction
+                    if DATE_RE.match(ln_stripped) or re.match(r'^\d{1,2}\s+[A-Za-z]{3}', ln_stripped):
+                        stopped = True
+                        break
+                    # If it contains "in debit" or "in credit", it's likely footer text, not a transaction
+                    if 'in debit' in low or 'in credit' in low:
+                        # This is footer text, not a transaction - continue processing
+                        continue
+                    # Otherwise, if it's a short line or looks like footer, skip it but don't stop
+                    # Only stop if it's clearly a transaction row
+                    # For now, be conservative - only stop if it starts with a date
+                    # (The transaction parsers will handle stopping on "closing balance" transactions)
                 flat.append(ln)
             if stopped:
                 break
@@ -838,12 +1100,17 @@ def main():
     if args.debug:
         print('Total body lines to parse:', len(lines), file=sys.stderr)
     # infer statement year from the page text so dates without year can be expanded
+    # Try to get both start and end years from period string (e.g., "Dec 2018 - Jan 2019")
     stmt_year = None
+    stmt_start_year = None
     for l in lines[:40]:
         m = re.search(r'(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s*-\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})', l)
         if m:
             try:
-                stmt_year = int(m.group(2).split()[-1])
+                start_year = int(m.group(1).split()[-1])
+                end_year = int(m.group(2).split()[-1])
+                stmt_start_year = start_year
+                stmt_year = end_year  # Use end year as default, but we'll track transitions
             except Exception:
                 stmt_year = None
             break
@@ -853,9 +1120,13 @@ def main():
             if m:
                 try:
                     stmt_year = int(m.group(1))
+                    stmt_start_year = stmt_year
                     break
                 except Exception:
                     continue
+    # If we have a start year, use it as the initial year (transactions typically start at the beginning of the period)
+    if stmt_start_year is not None:
+        stmt_year = stmt_start_year
     # Extract account number from first page
     account_number = ''
     if fitz is not None:
@@ -934,11 +1205,19 @@ def main():
         norm_rows.append([r[0], r[1], d, c, b])
 
     # convert Date field to DD/MM/YYYY format where possible
+    # Track current year and detect year transitions (e.g., Dec 2018 -> Jan 2019)
     month_map = {
         'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
         'jul': '07', 'aug': '08', 'sep': '09', 'sept': '09', 'oct': '10', 'nov': '11', 'dec': '12'
     }
+    month_num_map = {v: int(v) for v in month_map.values()}
+    
+    # Start with the statement year (which should be the start year if we detected a period)
+    current_year = stmt_year
+    last_month = None  # Track last month number seen (1-12)
+    
     def format_date_to_ddmmyyyy(s: str, fallback_year=None) -> str:
+        nonlocal current_year, last_month
         if not s:
             return s
         s = s.strip()
@@ -946,6 +1225,10 @@ def main():
         mslash = re.match(r'^(\d{1,2})\/(\d{1,2})\/(\d{4})$', s)
         if mslash:
             d = int(mslash.group(1)); mm = int(mslash.group(2)); yyyy = int(mslash.group(3))
+            # Update current_year and last_month based on this date
+            if yyyy != current_year:
+                current_year = yyyy
+            last_month = mm
             return f"{d:02d}/{mm:02d}/{yyyy}"
         # patterns like '25 Aug 2020' or '3 Nov 2020' or '03 Nov'
         m = re.match(r'^(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?$', s)
@@ -958,11 +1241,35 @@ def main():
                     year = int(m.group(3))
                 except Exception:
                     year = None
-            if year is None:
-                year = fallback_year
-            mm = month_map.get(mon[:3], None)
-            if mm and year:
-                return f"{day:02d}/{mm}/{year}"
+            
+            mm_str = month_map.get(mon[:3], None)
+            if mm_str:
+                mm = int(mm_str)
+                
+                # If year is explicitly provided, use it
+                if year is not None:
+                    current_year = year
+                    last_month = mm
+                elif fallback_year is not None:
+                    # No year provided - need to infer it
+                    if last_month is not None:
+                        # Detect year transition: if current month < last month, we've rolled over
+                        # (e.g., last_month=12 (Dec), current mm=1 (Jan) means year increased)
+                        if mm < last_month:
+                            # Year has rolled over - increment current_year
+                            current_year = current_year + 1
+                        # else: keep current_year as is (same year)
+                    else:
+                        # First date without year - use fallback (which should be the start year)
+                        current_year = fallback_year
+                    year = current_year
+                    last_month = mm
+                else:
+                    # No fallback year available
+                    return s
+                
+                if year:
+                    return f"{day:02d}/{mm_str}/{year}"
         # last resort: return original
         return s
 
