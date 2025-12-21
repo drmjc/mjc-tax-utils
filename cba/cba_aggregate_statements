@@ -1,0 +1,11 @@
+#!/bin/bash
+# Wrapper script to run cba_aggregate_statements.py with the correct venv
+# Usage: cba_aggregate_statements /path/to/folder [--out output.xlsx] [--fy]
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+VENV_PYTHON="$REPO_ROOT/cba/venv/bin/python"
+SCRIPT="$REPO_ROOT/cba/cba_aggregate_statements.py"
+
+exec "$VENV_PYTHON" "$SCRIPT" "$@"
+

@@ -159,8 +159,68 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                     out_lines.append(spans)
         return out_lines
 
+    # helper: check if a page is a notice letter that should be skipped
+    def is_notice_letter_page(page_text: str) -> bool:
+        """Check if a page is a notice letter (e.g., 'Notice of increase to repayments')."""
+        text_lower = page_text.lower()
+        # Check for notice letter indicators
+        notice_indicators = [
+            'notice of increase to repayments for your home loan',
+            'notice of increase to repayments',
+        ]
+        # Check if it contains notice indicators
+        has_notice = any(ind in text_lower for ind in notice_indicators)
+        # Check if it ends with "Yours sincerely" and "The CommBank Team"
+        has_signature = 'yours sincerely' in text_lower and 'the commbank team' in text_lower
+        
+        return has_notice or has_signature
+    
+    # helper: check if a page looks like a statement page (not a notice/cover page)
+    def is_statement_page(page_text: str) -> bool:
+        """Check if a page contains statement-like content."""
+        text_lower = page_text.lower()
+        
+        # First check if it's a notice letter - skip those
+        if is_notice_letter_page(page_text):
+            return False
+        
+        # Statement pages typically contain these keywords
+        statement_indicators = [
+            'your statement',
+            'statement period',
+            'account number',
+            'loan balance',
+            'opening balance',
+            'closing balance',
+            'statement 6',  # Statement number
+            'page 2 of 3',  # Page numbers
+            'page 3 of 3',
+            'page 1 of',
+        ]
+        # Non-statement pages (notices, covers) typically contain these
+        non_statement_indicators = [
+            'notice of',
+            'we\'re here to help',
+            'yours sincerely',
+            'the commbank team',
+            'if not already registered',
+            'netbank.com.au',
+        ]
+        # If it has non-statement indicators and no statement indicators, skip it
+        has_non_statement = any(ind in text_lower for ind in non_statement_indicators)
+        has_statement = any(ind in text_lower for ind in statement_indicators)
+        
+        # If it has statement indicators, it's a statement page
+        if has_statement:
+            return True
+        # If it has non-statement indicators but no statement indicators, it's not a statement page
+        if has_non_statement and not has_statement:
+            return False
+        # Default: if unsure, check if it has transaction table headers
+        return 'date' in text_lower and ('transaction' in text_lower or 'transaction description' in text_lower)
+
     # find header columns by scanning pages for a header line containing 'Date' and 'Transaction'
-    # Try to find header on first page, but if not found, continue searching
+    # Skip non-statement pages (notices, covers, etc.)
     col_centers = None
     header_page_idx = None
     header_line_idx = None
@@ -168,11 +228,51 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
     for p_i, page in enumerate(doc):
         pls = page_spans(page)
         pages_lines_spans.append(pls)
+        
+        # Check if this is a statement page
+        page_text = page.get_text()
+        if not is_statement_page(page_text):
+            if debug:
+                print(f'Skipping page {p_i+1}: not a statement page', file=sys.stderr)
+            continue
+        
         # Only search for header if we haven't found one yet
         if col_centers is None:
             for l_i, spans in enumerate(pls):
-                joined = ' '.join(s['text'] for s in spans).lower()
-                if ('date' in joined and ('transaction' in joined or 'transaction description' in joined)):
+                joined = ' '.join(s['text'] for s in spans).lower().strip()
+                # Look for "Date" header - it might be on a separate line from "Transaction description"
+                if joined == 'date':
+                    # Check if next few lines have "transaction", "debit", "credit", "balance"
+                    found_transaction = False
+                    found_debit_credit_balance = False
+                    header_lines = [l_i]
+                    
+                    # Check next 5 lines for transaction description and debit/credit/balance
+                    for j in range(l_i+1, min(len(pls), l_i+6)):
+                        next_joined = ' '.join(s['text'] for s in pls[j]).lower().strip()
+                        if 'transaction' in next_joined:
+                            found_transaction = True
+                            header_lines.append(j)
+                        if any(k in next_joined for k in ('debit', 'credit', 'balance')):
+                            found_debit_credit_balance = True
+                            if j not in header_lines:
+                                header_lines.append(j)
+                    
+                    if found_transaction and found_debit_credit_balance:
+                        # Found header: "Date" on one line, "Transaction description" and "Debit/Credit/Balance" on subsequent lines
+                        # Collect all spans from header lines for column centers
+                        all_spans = []
+                        for hl in header_lines:
+                            all_spans.extend(pls[hl])
+                        centers = [s['xmid'] for s in all_spans if s['text'].strip()]
+                        col_centers = centers
+                        header_page_idx = p_i
+                        header_line_idx = l_i
+                        if debug:
+                            print(f'Found header on page {p_i+1} line {l_i} (multi-line header: lines {header_lines}) centers={centers}', file=sys.stderr)
+                        break
+                # Also check for traditional single-line header
+                elif ('date' in joined and ('transaction' in joined or 'transaction description' in joined)):
                     # prefer header lines that start with 'date' or have multiple spans or are followed by Debit/Credit/Balance
                     has_table_labels = False
                     for j in range(l_i+1, min(len(pls), l_i+6)):
@@ -186,7 +286,7 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                         header_page_idx = p_i
                         header_line_idx = l_i
                         if debug:
-                            print(f'Found header on page {p_i} line {l_i} centers={centers} labels={has_table_labels}', file=sys.stderr)
+                            print(f'Found header on page {p_i+1} line {l_i} centers={centers} labels={has_table_labels}', file=sys.stderr)
                         break
 
     if not col_centers:
@@ -195,12 +295,26 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
     # add more centers for right-hand numeric columns by scanning nearby lines for 'Debit','Credit','Balance'
     # look at subsequent lines on the same page
     hdr_pls = pages_lines_spans[header_page_idx]
-    for j in range(header_line_idx+1, min(len(hdr_pls), header_line_idx+6)):
-        txt = ' '.join(s['text'] for s in hdr_pls[j]).lower()
-        if any(k in txt for k in ('debit', 'credit', 'balance')):
-            for s in hdr_pls[j]:
-                if s['text'].strip():
-                    col_centers.append(s['xmid'])
+    # Check if header was split across lines (Date on one line, Transaction on next)
+    # We already collected all header spans in the detection above, so we just need to ensure
+    # we have enough column centers. If we found a multi-line header, the centers should already
+    # include all the header columns. Otherwise, scan for additional columns.
+    next_line_has_transaction = False
+    if header_line_idx + 1 < len(hdr_pls):
+        next_txt = ' '.join(s['text'] for s in hdr_pls[header_line_idx + 1]).lower()
+        if 'transaction' in next_txt:
+            next_line_has_transaction = True
+    
+    # If we have fewer than 4 column centers, try to find more from Debit/Credit/Balance lines
+    if len(col_centers) < 4:
+        # Start scanning from after the transaction line if it's on a separate line
+        start_scan = header_line_idx + (2 if next_line_has_transaction else 1)
+        for j in range(start_scan, min(len(hdr_pls), start_scan + 6)):
+            txt = ' '.join(s['text'] for s in hdr_pls[j]).lower()
+            if any(k in txt for k in ('debit', 'credit', 'balance')):
+                for s in hdr_pls[j]:
+                    if s['text'].strip():
+                        col_centers.append(s['xmid'])
     # normalize and sort unique centers
     col_centers = sorted(list(dict.fromkeys(col_centers)))
     if debug:
@@ -352,8 +466,20 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
             
         for l_i, spans in enumerate(pls):
             # skip everything before header line on the header page
-            if p_i == header_page_idx and l_i <= header_line_idx:
-                continue
+            # If header was split (Date on one line, Transaction on next), skip both lines
+            if p_i == header_page_idx:
+                if l_i <= header_line_idx:
+                    continue
+                # Also skip the transaction description line if it's right after Date
+                if l_i == header_line_idx + 1:
+                    next_txt = ' '.join(s['text'] for s in spans).lower()
+                    if 'transaction' in next_txt:
+                        continue
+                # Skip Debit/Credit/Balance header lines
+                if l_i <= header_line_idx + 3:
+                    txt = ' '.join(s['text'] for s in spans).lower()
+                    if txt.strip() in ('debit', 'credit', 'balance', 'debits', 'credits'):
+                        continue
                 
             # For subsequent pages, skip repeated header lines that appear at the top
             if p_i > header_page_idx:
@@ -413,29 +539,70 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
             if is_date:
                 # finalize previous current row
                 if current is not None:
+                    # Apply tokens first to get final amounts
                     current = apply_tokens_to_row(current, current_tokens)
-                    # sanitize amounts in current before append
-                    def clean_amt(a):
-                        if not a:
-                            return ''
-                        # Preserve negative sign if present
-                        is_negative = a.startswith('-')
-                        m = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2}))', a.replace('$',''))
-                        result = m.group(1) if m else a
-                        # Restore negative sign if it was present
-                        if is_negative and result:
-                            result = '-' + result
-                        return result
-                    current[2] = clean_amt(current[2])
-                    current[3] = clean_amt(current[3])
-                    # For balance, preserve the value as set by apply_tokens_to_row (which handles DR)
-                    # Don't clean it if it's already a formatted negative value
-                    if current[4] and not current[4].startswith('-') and not current[4].startswith('$'):
-                        current[4] = clean_amt(current[4])
-                    elif not current[4]:
-                        current[4] = clean_amt(current[4])
-                    rows.append(current)
-                    current_tokens = []
+                    # Skip if transaction has empty description and no meaningful amounts (informational messages)
+                    if (not current[1] or len(current[1].strip()) == 0):
+                        # Check if there are non-zero amounts after applying tokens
+                        def is_non_zero_amount(amt_str):
+                            if not amt_str or not amt_str.strip():
+                                return False
+                            try:
+                                val = float(amt_str.replace(',', '').replace('$', '').strip())
+                                return abs(val) > 0.001  # Non-zero
+                            except:
+                                return False
+                        has_meaningful_amounts = is_non_zero_amount(current[2]) or is_non_zero_amount(current[3]) or is_non_zero_amount(current[4])
+                        if not has_meaningful_amounts:
+                            if debug:
+                                print(f'Skipping finalized transaction with empty description and no amounts: date={current[0]}', file=sys.stderr)
+                            current = None
+                            current_tokens = []
+                        else:
+                            # Has amounts, so it's a valid transaction even without description
+                            # sanitize amounts
+                            def clean_amt(a):
+                                if not a:
+                                    return ''
+                                is_negative = a.startswith('-')
+                                m = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2}))', a.replace('$',''))
+                                result = m.group(1) if m else a
+                                if is_negative and result:
+                                    result = '-' + result
+                                return result
+                            current[2] = clean_amt(current[2])
+                            current[3] = clean_amt(current[3])
+                            if current[4] and not current[4].startswith('-') and not current[4].startswith('$'):
+                                current[4] = clean_amt(current[4])
+                            elif not current[4]:
+                                current[4] = clean_amt(current[4])
+                            rows.append(current)
+                            current_tokens = []
+                    else:
+                        # Has description, process normally
+                        current = apply_tokens_to_row(current, current_tokens)
+                        # sanitize amounts in current before append
+                        def clean_amt(a):
+                            if not a:
+                                return ''
+                            # Preserve negative sign if present
+                            is_negative = a.startswith('-')
+                            m = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2}))', a.replace('$',''))
+                            result = m.group(1) if m else a
+                            # Restore negative sign if it was present
+                            if is_negative and result:
+                                result = '-' + result
+                            return result
+                        current[2] = clean_amt(current[2])
+                        current[3] = clean_amt(current[3])
+                        # For balance, preserve the value as set by apply_tokens_to_row (which handles DR)
+                        # Don't clean it if it's already a formatted negative value
+                        if current[4] and not current[4].startswith('-') and not current[4].startswith('$'):
+                            current[4] = clean_amt(current[4])
+                        elif not current[4]:
+                            current[4] = clean_amt(current[4])
+                        rows.append(current)
+                        current_tokens = []
                 # start new current row from this line
                 # split the matched date from any trailing text on the same column
                 mdate = DATE_RE.match(date_txt)
@@ -468,7 +635,8 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                     if debug:
                         print(f'Stopping: found "closing balance" in date="{date}" or transaction="{transaction}"', file=sys.stderr)
                     break
-                if any(skip_term in trans_lower for skip_term in [
+                # Skip transactions that start with skip terms
+                if transaction and any(trans_lower.startswith(skip_term) for skip_term in [
                     'interest rate as of',
                     'interest rate applied to',
                     'opening balance',
@@ -476,6 +644,18 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                 ]):
                     if debug:
                         print(f'Skipping transaction: {transaction}', file=sys.stderr)
+                    continue
+                # Don't skip transactions with empty descriptions yet - wait to see if next line provides description
+                # We'll check this when we finalize the transaction (when we encounter the next date)
+                # Also check if transaction contains skip terms (for multi-line transactions that got merged)
+                # Skip if the transaction description is primarily a skip term (short transactions)
+                if transaction and any(skip_term in trans_lower for skip_term in [
+                    'interest rate as of',
+                    'interest rate applied to',
+                    'change in interest rate'
+                ]) and len(transaction) < 100:  # Short transactions that are just skip terms
+                    if debug:
+                        print(f'Skipping transaction (contains skip term): {transaction}', file=sys.stderr)
                     continue
                 # Skip informational messages that are not real transactions
                 if any(skip_term in trans_lower for skip_term in [
@@ -520,10 +700,50 @@ def parse_using_blocks(pdf_path: str, debug: bool = False) -> List[List[str]]:
                         if debug:
                             print(f'Skipping metadata line: {desc_piece[:50]}', file=sys.stderr)
                         continue
+                    # Check if this desc_piece is a skip term - if so, stop merging and finalize current transaction
+                    desc_lower = desc_piece.lower().strip()
+                    if any(desc_lower.startswith(skip_term) for skip_term in [
+                        'interest rate as of',
+                        'interest rate applied to',
+                        'change in interest rate',
+                        'we confirm',
+                        'we have processed',
+                        'effective as at',
+                        'required monthly repayment',
+                        'loan term',
+                        'direct debit repayment amount'
+                    ]):
+                        # This is an informational message, not part of the transaction
+                        # Finalize the current transaction before this message
+                        if current is not None:
+                            current = apply_tokens_to_row(current, current_tokens)
+                            # sanitize amounts
+                            def clean_amt(a):
+                                if not a:
+                                    return ''
+                                is_negative = a.startswith('-')
+                                m = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2}))', a.replace('$',''))
+                                result = m.group(1) if m else a
+                                if is_negative and result:
+                                    result = '-' + result
+                                return result
+                            current[2] = clean_amt(current[2])
+                            current[3] = clean_amt(current[3])
+                            if current[4] and not current[4].startswith('-') and not current[4].startswith('$'):
+                                current[4] = clean_amt(current[4])
+                            elif not current[4]:
+                                current[4] = clean_amt(current[4])
+                            rows.append(current)
+                            current_tokens = []
+                        current = None
+                        if debug:
+                            print(f'Stopping merge at informational message: {desc_piece[:50]}', file=sys.stderr)
+                        continue
+                    
                     current[1] = (current[1] + ' ' + desc_piece).strip()
-                    # Check if the merged transaction should be skipped
+                    # Check if the merged transaction should be skipped (only if it STARTS with a skip term)
                     trans_lower = re.sub(r'\s+', ' ', current[1].lower().strip())
-                    if any(skip_term in trans_lower for skip_term in [
+                    if any(trans_lower.startswith(skip_term) for skip_term in [
                         'interest rate as of',
                         'interest rate applied to',
                         'opening balance',
@@ -1052,8 +1272,104 @@ def main():
     if args.debug:
         print('Reading:', args.pdf, file=sys.stderr)
     extracted = extract_text_with_fitz(args.pdf)
+    
+    # helper: check if a page is a notice letter that should be skipped
+    def is_notice_letter_page_text(page_text: str) -> bool:
+        """Check if a page is a notice letter (e.g., 'Notice of increase to repayments for your home loan').
+        
+        The notice letter typically:
+        - Contains "Notice of increase to repayments for your home loan"
+        - Ends with "Yours sincerely" followed by "The CommBank Team"
+        """
+        text_lower = page_text.lower()
+        # Check for the specific notice letter pattern
+        has_notice_title = 'notice of increase to repayments for your home loan' in text_lower
+        # Check if it ends with the signature block
+        has_signature = 'yours sincerely' in text_lower and 'the commbank team' in text_lower
+        
+        # It's a notice letter if it has the title OR the signature block
+        # (the signature might be on a different page)
+        return has_notice_title or has_signature
+    
+    # helper: check if a page looks like a statement page (not a notice/cover page)
+    def is_statement_page_text(page_text: str) -> bool:
+        """Check if a page contains statement-like content."""
+        text_lower = page_text.lower()
+        
+        # Special case: Skip notice letters first
+        if is_notice_letter_page_text(page_text):
+            return False
+        
+        # Statement pages typically contain these keywords
+        statement_indicators = [
+            'your statement',
+            'statement period',
+            'account number',
+            'loan balance',
+            'opening balance',
+            'closing balance',
+            'statement 6',  # Statement number
+            'page 2 of 3',  # Page numbers
+            'page 3 of 3',
+            'page 1 of',
+        ]
+        # Non-statement pages (notices, covers) typically contain these
+        non_statement_indicators = [
+            'notice of',
+            'we\'re here to help',
+            'yours sincerely',
+            'the commbank team',
+            'if not already registered',
+            'netbank.com.au',
+        ]
+        # If it has non-statement indicators and no statement indicators, skip it
+        has_non_statement = any(ind in text_lower for ind in non_statement_indicators)
+        has_statement = any(ind in text_lower for ind in statement_indicators)
+        
+        # If it has statement indicators, it's a statement page
+        if has_statement:
+            return True
+        # If it has non-statement indicators but no statement indicators, it's not a statement page
+        if has_non_statement and not has_statement:
+            return False
+        # Default: if unsure, check if it has transaction table headers
+        return 'date' in text_lower and ('transaction' in text_lower or 'transaction description' in text_lower)
+    
     # If extract returned per-page lines, split pages into sections and use bodies
     if isinstance(extracted, list) and extracted and isinstance(extracted[0], list):
+        # First, check each page to see if it's a statement page
+        # Special case: Skip notice letters at the beginning
+        if fitz is not None:
+            doc = fitz.open(args.pdf)
+            statement_page_indices = []
+            notice_letter_detected = False
+            for p_i in range(len(doc)):
+                page_text = doc[p_i].get_text()
+                # Check if this is a notice letter page
+                if is_notice_letter_page_text(page_text):
+                    notice_letter_detected = True
+                    if args.debug:
+                        print(f'Skipping page {p_i+1}: notice letter page', file=sys.stderr)
+                    continue
+                # After skipping notice letters, check if it's a statement page
+                if is_statement_page_text(page_text):
+                    statement_page_indices.append(p_i)
+                elif args.debug:
+                    print(f'Skipping page {p_i+1} in line parser: not a statement page', file=sys.stderr)
+            doc.close()
+            
+            if notice_letter_detected and args.debug:
+                print(f'Notice letter detected and skipped, continuing with regular parsing', file=sys.stderr)
+            
+            # Only process statement pages
+            if statement_page_indices:
+                extracted = [extracted[i] for i in statement_page_indices]
+                if args.debug:
+                    print(f'Processing {len(extracted)} statement page(s) (indices: {[i+1 for i in statement_page_indices]})', file=sys.stderr)
+            else:
+                if args.debug:
+                    print('Warning: No statement pages found, processing all pages', file=sys.stderr)
+        
         pages = split_page_sections(extracted)
         # build flattened lines using only page bodies, drop headers/footers
         flat = []
