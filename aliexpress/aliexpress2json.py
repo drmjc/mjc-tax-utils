@@ -467,9 +467,8 @@ def extract_invoice_data(pdf_path):
             "amount_aud": delivery_fee_aud,
             "prorated_across_items": len(rows)
         }
-    # Add a summary of exchange rates used
-    if used_exchange_rates:
-        result["exchange_rates"] = used_exchange_rates
+    # Add a summary of exchange rates used (always include, even if empty)
+    result["exchange_rates"] = used_exchange_rates
     
     return result
 

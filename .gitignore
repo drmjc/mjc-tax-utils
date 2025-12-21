@@ -3,3 +3,4 @@ __pycache__
 .DS_Store
 venv
 exchange_rate_cache.json
+.vscode/settings.json

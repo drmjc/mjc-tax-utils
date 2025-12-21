@@ -1,0 +1,16 @@
+# Core dependencies for all scripts
+pymupdf>=1.26.0          # PDF parsing (fitz) - used in aliexpress2json.py, statement2tsv.py, rename_AliExpress_invoices.py
+requests>=2.32.0          # HTTP requests for exchange rate API in aliexpress2json.py
+python-dotenv>=1.0.0      # Environment variable management for API keys
+pandas>=2.3.0             # Data manipulation for aggregate_aliexpress_invoices.py
+openpyxl>=3.1.0           # Excel file support for pandas (.xlsx output)
+
+# Testing
+pytest>=7.0.0             # Testing framework
+
+# Optional dependencies for Bunnings scripts
+# Uncomment these if you need to use the bunnings/ scripts:
+# PyPDF2>=3.0.0           # Required for parse_bunnings_transactions.py, optional fallback for parse_scanned_bunnings.py
+# pdf2image>=1.16.0      # Optional: PDF to image conversion for OCR in parse_scanned_bunnings.py
+# pytesseract>=0.3.10    # Optional: OCR engine wrapper for parse_scanned_bunnings.py
+# Pillow>=10.0.0          # Optional: Image processing for OCR in parse_scanned_bunnings.py
