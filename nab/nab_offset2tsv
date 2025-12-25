@@ -1,0 +1,20 @@
+#!/bin/bash
+# Wrapper script for nab_offset2tsv.py
+# Ensures the script runs with the correct virtual environment
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="${SCRIPT_DIR}/../cba/venv/bin/python"
+SCRIPT="${SCRIPT_DIR}/nab_offset2tsv.py"
+
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "Error: Virtual environment not found at ${VENV_PYTHON}" >&2
+    exit 1
+fi
+
+if [ ! -f "$SCRIPT" ]; then
+    echo "Error: Script not found at ${SCRIPT}" >&2
+    exit 1
+fi
+
+exec "$VENV_PYTHON" "$SCRIPT" "$@"
+
