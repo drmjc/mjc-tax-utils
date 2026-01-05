@@ -5,6 +5,9 @@ Date<TAB>Account Number<TAB>Transaction<TAB>Amount<TAB>Balance
 
 Usage:
     python3 nab/nab_offset2tsv.py input.pdf [--out output.tsv] [--debug]
+See also:
+nab_offset2tsv.sh, a wrapper script that runs the script with the correct virtual environment
+
 """
 import sys
 import re
@@ -122,13 +125,13 @@ def extract_first_page_info(pdf_path: str, debug: bool = False) -> Tuple[Optiona
                 break
     
     # Extract statement period and year
-    # Look for "Statement starts" and "Statement ends"
+    # Look for "Statement start(s)" and "Statement end(s)" (handles both singular and plural)
     start_date = None
     end_date = None
     for i, line in enumerate(lines):
-        if re.search(r'(?i)statement starts', line):
+        if re.search(r'(?i)statement start', line):  # Matches both "start" and "starts"
             # Date might be on same line or next line
-            # Pattern: "Statement starts 17 May 2024" or "Statement starts" followed by "17 May 2024"
+            # Pattern: "Statement start 17 May 2024" or "Statement start" followed by "17 May 2024"
             m = re.search(r'(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})', line)
             if m:
                 start_date = m.group(1)
@@ -137,9 +140,13 @@ def extract_first_page_info(pdf_path: str, debug: bool = False) -> Tuple[Optiona
                 m = re.search(r'(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})', start_line)
                 if m:
                     start_date = m.group(1)
-        if re.search(r'(?i)statement ends', line):
-            # Date is on next line
-            if i + 1 < len(lines):
+        if re.search(r'(?i)statement end', line):  # Matches both "end" and "ends"
+            # Date might be on same line or next line
+            # Pattern: "Statement end 20 November 2024" or "Statement end" followed by "20 November 2024"
+            m = re.search(r'(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})', line)
+            if m:
+                end_date = m.group(1)
+            elif i + 1 < len(lines):
                 end_line = lines[i + 1]
                 # Pattern: "20 November 2024"
                 m = re.search(r'(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})', end_line)
@@ -161,7 +168,7 @@ def extract_first_page_info(pdf_path: str, debug: bool = False) -> Tuple[Optiona
         print('Warning: Could not find account number on first page', file=sys.stderr)
     
     if not period_string or year is None:
-        raise ValueError('Could not find statement period on first page')
+        raise ValueError(f'Could not find statement period on first page of {pdf_path}')
     
     return account_number or '', period_string, year
 
@@ -265,6 +272,66 @@ def is_footer_line(line: str) -> bool:
 
 def clean_transaction_name(name: str) -> str:
     """Remove trailing dots and embedded amounts from transaction name."""
+    # Special case: Long offset account interest messages should be simplified to "Interest Charged"
+    # Pattern: "By Depositing Your Savings In A Linked 100% Offset Account... Interest Charged"
+    if 'By Depositing Your Savings In A Linked' in name and 'Interest Charged' in name:
+        # Extract just "Interest Charged" from the end
+        match = re.search(r'Interest Charged\s*$', name, re.IGNORECASE)
+        if match:
+            return 'Interest Charged'
+    
+    # Remove footer/header text that got mixed into transaction names
+    # Pattern: "Loan Repayment ... NAB Offset Home Loan ... From A/C"
+    # Should become: "Loan Repayment ... From A/C"
+    if 'nab offset home loan' in name.lower() and 'from a/c' in name.lower():
+        # Find the part before "NAB Offset" and the part starting with "From A/C"
+        # Match more flexibly - "NAB Offset Home Loan" followed by any text until "From A/C"
+        match = re.search(r'^(.*?)\s+NAB\s+Offset\s+Home\s+Loan.*?(From\s+A/C\s+.*?)$', name, re.IGNORECASE | re.DOTALL)
+        if match:
+            before = match.group(1).strip()
+            after = match.group(2).strip()
+            name = f"{before} {after}"
+        else:
+            # Fallback: remove everything from "NAB Offset" to just before "From A/C"
+            name = re.sub(r'\s+NAB\s+Offset\s+Home\s+Loan.*?(?=\s+From\s+A/C)', '', name, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Pattern 2: "Transaction ... NAB Classic Banking ... Ref: ..."
+    # Should become: "Transaction ... Ref: ..."
+    if 'nab classic banking' in name.lower() and 'ref:' in name.lower():
+        # Find the part before "NAB Classic Banking" and the part starting with "Ref:"
+        # Use split to separate, then find Ref: in the second part
+        parts = re.split(r'\s+NAB\s+Classic\s+Banking', name, flags=re.IGNORECASE, maxsplit=1)
+        if len(parts) == 2:
+            before = parts[0].strip()
+            after_part = parts[1]
+            # Find "Ref:" in the after part, removing any parenthetical content before it
+            # Remove any content in parentheses between "NAB Classic Banking" and "Ref:"
+            after_part = re.sub(r'\([^)]*\)', '', after_part)  # Remove all parenthetical content
+            ref_match = re.search(r'Ref:\s+.*?$', after_part, re.IGNORECASE | re.DOTALL)
+            if ref_match:
+                after = ref_match.group(0).strip()
+                name = f"{before} {after}"
+            else:
+                # If no Ref: found, just remove the NAB Classic Banking part
+                name = before
+    
+    # Remove special characters and patterns that appear between transaction name and Ref:
+    # Pattern like "(√ê0Z√ß√ü1)" or similar garbage characters that appear before "Ref:"
+    # If "Ref:" is present, remove any parenthetical content between the transaction name and "Ref:"
+    if 'ref:' in name.lower():
+        # Find the position of "Ref:" and remove any parentheses before it
+        ref_pos = name.lower().find('ref:')
+        if ref_pos > 0:
+            before_ref = name[:ref_pos]
+            after_ref = name[ref_pos:]
+            # Remove all parenthetical content from before_ref (including non-ASCII characters)
+            # Match parentheses with any content inside, including special characters
+            before_ref = re.sub(r'\([^)]*\)', '', before_ref)
+            # Also remove any standalone parenthetical patterns that might have unmatched parentheses
+            # Remove patterns like "(..." where ... contains non-printable or garbage characters
+            before_ref = re.sub(r'\([^a-zA-Z0-9\s)]*\)', '', before_ref)
+            name = before_ref + after_ref
+    
     # Remove trailing dots
     cleaned = re.sub(r'\.+$', '', name.strip())
     # Remove amounts at the end (pattern: dots followed by number with comma/decimal)
@@ -304,6 +371,25 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
     last_month = None
     running_balance = None  # Track running balance
     processed_dates = set()  # Track dates we've already processed to avoid duplicates
+    
+    # Extract opening balance from first page if available
+    first_page = doc[0]
+    first_page_text = extract_text_from_page(first_page)
+    first_page_lines = [l.strip() for l in first_page_text.split('\n') if l.strip()]
+    for i, line in enumerate(first_page_lines):
+        line_lower = line.lower()
+        if 'opening balance' in line_lower and i + 1 < len(first_page_lines):
+            # Next line should have the balance amount
+            balance_line = first_page_lines[i + 1]
+            balance_match = re.search(r'[\$]?\s*([\d,]+\.\d{2})\s*(DR|CR|Dr|Cr)', balance_line, re.IGNORECASE)
+            if balance_match:
+                balance_amt = parse_amount(balance_match.group(1))
+                is_debit = balance_match.group(2).upper() == 'DR'
+                if balance_amt is not None:
+                    running_balance = -balance_amt if is_debit else balance_amt
+                    if debug:
+                        print(f'DEBUG: Found opening balance: {running_balance}', file=sys.stderr)
+                    break
     
     # Date patterns: "DD MMM YYYY" or "DD MMM"
     date_pattern = re.compile(r'^(\d{1,2}\s+[A-Za-z]{3,})\s*$')
@@ -357,14 +443,21 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                 continue
             
             # Skip informational messages and page boundary markers
+            # BUT: "Brought forward" on its own line should be skipped, but transactions after it should be collected
+            # So we only skip "Brought forward" if it's a standalone line (not part of transaction collection)
             if any(skip_term in line_lower for skip_term in [
                 'if a charge is incorrect',
                 'if you have any queries',
-                'brought forward',
                 'carried forward',
                 'transaction details',
                 'transaction details (continued)'
             ]):
+                i += 1
+                continue
+            
+            # Skip "Brought forward" only if it's a standalone line (not followed immediately by a transaction)
+            # This allows transactions after "Brought forward" to be collected in the date collection logic
+            if line_lower.strip() == 'brought forward':
                 i += 1
                 continue
             
@@ -533,28 +626,52 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                             j += 1
                             continue
                         
-                        # Skip "Carried forward" and "Brought forward" lines (page boundary markers)
-                        # These just reflect the balance at page boundaries, not actual transactions
-                        # BUT we need to continue collecting transaction lines after "Brought forward"
+                        # Skip footer/header text that appears at page boundaries
+                        # These lines contain information like "NAB Offset Home Loan For further information call..."
+                        # or "NAB Classic Banking" footer text
+                        # Also skip informational text that appears between transactions
+                        if any(skip_phrase in next_lower for skip_phrase in [
+                            'for further information call',
+                            'for personal accounts or',
+                            'for business accounts',
+                            'nab offset home loan for further',
+                            'nab offset home loan for fur',
+                            'nab classic banking',
+                            'if a charge is incorrect',
+                            'you may be entitled to a refund',
+                            'you should act quickly',
+                            'please call 13 22 65',
+                            'nab.com.au/terms',
+                            'disputed transactions'
+                        ]):
+                            # Skip this line and continue collecting (don't break, as transaction may continue)
+                            j += 1
+                            continue
+                        
+                        # Handle "Carried forward" - stop reading this page and move to next page
+                        # Rule: when "Carried forward" is read, stop reading that page, then skip over "Brought forward" on next page
                         if 'carried forward' in next_lower:
                             page_boundary_seen = True
-                            # Skip "Carried forward" and the balance line(s) that follow
+                            # Stop reading this page - break out of inner loop to move to next page
+                            # "Brought forward" will be skipped when we start the next page
+                            if debug:
+                                print(f'DEBUG: Found "Carried forward" on page {current_page_idx+1}, stopping page and moving to next', file=sys.stderr)
+                            break  # Break out of inner loop to move to next page
+                        elif 'brought forward' in next_lower:
+                            page_boundary_seen = True
+                            # Skip "Brought forward" and the balance line that follows
+                            # This should only be encountered when we've moved to a new page after "Carried forward"
                             j += 1
                             if j < len(current_page_lines):
                                 next_next_line = current_page_lines[j]
-                                # Check if next line is CR/DR followed by balance amount
+                                # Check if it's a balance (CR/DR followed by amount, or just an amount)
                                 if next_next_line.strip().lower() in ('cr', 'dr'):
                                     j += 1  # Skip CR/DR
                                     if j < len(current_page_lines) and re.search(r'[\d,]+\.\d{2}', current_page_lines[j]):
                                         j += 1  # Skip balance amount
                                 elif re.search(r'[\d,]+\.\d{2}', next_next_line):
                                     j += 1  # Skip balance amount
-                            continue
-                        elif 'brought forward' in next_lower:
-                            page_boundary_seen = True
-                            # Skip "Brought forward" itself, but continue collecting transactions
-                            # The balance after "Brought forward" will be handled by the balance detection logic below
-                            j += 1
+                            # Continue collecting transactions after "Brought forward"
                             continue
                         
                         # Check if this is the balance for the day
@@ -591,13 +708,16 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                     if day_end_balance is not None:
                         break
                     
-                    # Check if we've exhausted this page, move to next page
-                    if j >= len(current_page_lines):
+                    # Check if we've exhausted this page, or if we broke due to "Carried forward"
+                    # In either case, move to next page
+                    if j >= len(current_page_lines) or page_boundary_seen:
                         current_page_idx += 1
                         page_boundary_seen = False
                         if current_page_idx >= len(doc):
                             # Reached end of document, break
                             break
+                        # Continue to next iteration of outer loop, which will skip "Brought forward" on new page
+                        continue
                     else:
                         # Still processing current page, but something went wrong, break to avoid infinite loop
                         if debug:
@@ -611,6 +731,8 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                 transactions_for_day = []  # List of (description, (amount, is_debit)) tuples
                 current_trans_desc = []
                 current_trans_amount = None  # Will be (amount, is_debit) when found
+                # Track the last transaction saved without an amount (for matching amounts found later)
+                last_incomplete_transaction_idx = None
                 
                 # Transaction start keywords (case-insensitive)
                 transaction_keywords = ['online', 'eftpos', 'po', 'lc', 'v6606', 'refund', 'monthly pay', 
@@ -673,12 +795,21 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                             trans_so_far = ' '.join(current_trans_desc + [desc_part]).lower()
                             is_clear_credit = any(kw in trans_so_far for kw in [
                                 'monthly pay', 'salary', 'direct credit', 'credit interest',
-                                'transfer from', 'transfer in', 'deposit', 'refund'
+                                'transfer from', 'transfer in', 'deposit', 'refund',
+                                'from a/c', 'from a/c '  # "Loan Repayment ... From A/C" is a credit (money coming in)
                             ])
                             is_debit = num_dots < 100 and not is_clear_credit
                             current_trans_amount = (amt, is_debit)
+                            # Check if we have a saved transaction without an amount that this amount belongs to
+                            # This happens when a transaction code was detected and we saved the transaction without an amount
+                            if not current_trans_desc and last_incomplete_transaction_idx is not None:
+                                # Update the incomplete transaction with this amount
+                                prev_desc, _ = transactions_for_day[last_incomplete_transaction_idx]
+                                transactions_for_day[last_incomplete_transaction_idx] = (prev_desc, current_trans_amount)
+                                last_incomplete_transaction_idx = None
+                                current_trans_amount = None
                             # This transaction is complete - save it
-                            if current_trans_desc:
+                            elif current_trans_desc:
                                 trans_desc = clean_transaction_name(' '.join(current_trans_desc).strip())
                                 if trans_desc:
                                     transactions_for_day.append((trans_desc, current_trans_amount))
@@ -704,12 +835,20 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                                 trans_so_far = ' '.join(current_trans_desc).lower()
                                 is_clear_credit = any(kw in trans_so_far for kw in [
                                     'monthly pay', 'salary', 'direct credit', 'credit interest',
-                                    'transfer from', 'transfer in', 'deposit', 'refund'
+                                    'transfer from', 'transfer in', 'deposit', 'refund',
+                                    'from a/c', 'from a/c '  # "Loan Repayment ... From A/C" is a credit (money coming in)
                                 ])
                                 is_debit = num_dots < 100 and not is_clear_credit
                                 current_trans_amount = (amt, is_debit)
+                                # Check if we have a saved transaction without an amount that this amount belongs to
+                                if not current_trans_desc and last_incomplete_transaction_idx is not None:
+                                    # Update the incomplete transaction with this amount
+                                    prev_desc, _ = transactions_for_day[last_incomplete_transaction_idx]
+                                    transactions_for_day[last_incomplete_transaction_idx] = (prev_desc, current_trans_amount)
+                                    last_incomplete_transaction_idx = None
+                                    current_trans_amount = None
                                 # Save transaction
-                                if current_trans_desc:
+                                elif current_trans_desc:
                                     trans_desc = clean_transaction_name(' '.join(current_trans_desc).strip())
                                     if trans_desc:
                                         transactions_for_day.append((trans_desc, current_trans_amount))
@@ -720,10 +859,84 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                     
                     # Pattern 3: Description line (contains letters)
                     if re.search(r'[a-zA-Z]', line):
+                        # Check if this line starts with a transaction code (e.g., "V6741", "V6606", "E5778714428") or transaction keyword
+                        # Transaction code pattern: 1-3 letters followed by 3-10 digits at the start of the line
+                        # Also check for longer transaction IDs like "E5778714428" (1 letter + 8+ digits) at the START
+                        transaction_code_at_start = (re.match(r'^([A-Z]{1,3}\d{3,10})\s+', line, re.IGNORECASE) or
+                                                     re.match(r'^([A-Z]\d{8,})\s+', line, re.IGNORECASE))  # Pattern for longer IDs like E5778714428
+                        transaction_code_match = transaction_code_at_start
+                        starts_with_keyword = any(line_lower.startswith(kw.lower()) for kw in transaction_keywords)
+                        
+                        # Check if this looks like a continuation line (e.g., "Ref: ...") that should be added to current or incomplete transaction
+                        # Only treat clear continuation indicators as continuations, not names or other text
+                        is_continuation = (line_lower.startswith('ref:') or 
+                                         line_lower.startswith('inv '))
+                        
+                        # If we have an incomplete transaction and this is a clear continuation (Ref: or Inv:), add it to that transaction
+                        if last_incomplete_transaction_idx is not None and is_continuation and not current_trans_desc:
+                            # This is a continuation line for the incomplete transaction (current_trans_desc is empty)
+                            prev_desc, _ = transactions_for_day[last_incomplete_transaction_idx]
+                            updated_desc = clean_transaction_name(f"{prev_desc} {line}".strip())
+                            transactions_for_day[last_incomplete_transaction_idx] = (updated_desc, (0.0, True))
+                            line_idx += 1
+                            continue
+                        # If we're building a current transaction and this is a clear continuation, add it
+                        elif current_trans_desc and is_continuation and not transaction_code_match:
+                            # This is a continuation line for the current transaction being built
+                            current_trans_desc.append(line)
+                            line_idx += 1
+                            continue
+                        
                         # If we already have a completed transaction (with amount), this is a new transaction
                         if current_trans_amount is not None and current_trans_desc:
                             # Previous transaction was already saved when we found the amount
                             # This line starts a new transaction
+                            current_trans_desc = [line]
+                            current_trans_amount = None
+                        # If this line starts with a transaction code and we have an existing description,
+                        # it's definitely a new transaction (especially after page boundaries)
+                        elif transaction_code_match and current_trans_desc:
+                            # Clear transaction code detected - this is definitely a new transaction
+                            # Save previous transaction immediately (don't look ahead - that causes merging issues)
+                            # Check if the previous line (line_idx - 1) has an amount we can use
+                            prev_amount = current_trans_amount
+                            if not prev_amount and line_idx > 0:
+                                prev_line = collected_lines[line_idx - 1]
+                                # Check if previous line has an amount with dots
+                                prev_dots_amt = re.search(r'(\.{3,})\s*([\d,]+\.\d{2})\s*$', prev_line)
+                                if prev_dots_amt:
+                                    amount_str = prev_dots_amt.group(2)
+                                    amt = parse_amount(amount_str)
+                                    if amt is not None:
+                                        num_dots = len(prev_dots_amt.group(1))
+                                        trans_so_far = ' '.join(current_trans_desc).lower()
+                                        is_clear_credit = any(kw in trans_so_far for kw in [
+                                            'monthly pay', 'salary', 'direct credit', 'credit interest',
+                                            'transfer from', 'transfer in', 'deposit', 'refund',
+                                            'from a/c', 'from a/c '
+                                        ])
+                                        is_debit = num_dots < 100 and not is_clear_credit
+                                        prev_amount = (amt, is_debit)
+                            
+                            prev_desc = clean_transaction_name(' '.join(current_trans_desc).strip())
+                            if prev_desc:
+                                if prev_amount:
+                                    transactions_for_day.append((prev_desc, prev_amount))
+                                    last_incomplete_transaction_idx = None
+                                else:
+                                    # No amount found yet - save it and track it for later matching
+                                    transactions_for_day.append((prev_desc, (0.0, True)))
+                                    last_incomplete_transaction_idx = len(transactions_for_day) - 1
+                            # Start new transaction
+                            current_trans_desc = [line]
+                            current_trans_amount = None
+                        # If this line starts with a transaction keyword (but not a code) and we have an existing description,
+                        # it might be a new transaction, but be more cautious
+                        elif starts_with_keyword and current_trans_desc and current_trans_amount is not None:
+                            # Previous transaction has an amount, save it and start new
+                            prev_desc = clean_transaction_name(' '.join(current_trans_desc).strip())
+                            if prev_desc:
+                                transactions_for_day.append((prev_desc, current_trans_amount))
                             current_trans_desc = [line]
                             current_trans_amount = None
                         else:
@@ -751,8 +964,15 @@ def parse_transactions(pdf_path: str, account_number: str, year: int, debug: boo
                                     'shortfall', 'linked acc trns', 'online'
                                 ])
                                 current_trans_amount = (amt, is_likely_debit)
+                            # Check if we have a saved transaction without an amount that this amount belongs to
+                            if not current_trans_desc and last_incomplete_transaction_idx is not None:
+                                # Update the incomplete transaction with this amount
+                                prev_desc, _ = transactions_for_day[last_incomplete_transaction_idx]
+                                transactions_for_day[last_incomplete_transaction_idx] = (prev_desc, current_trans_amount)
+                                last_incomplete_transaction_idx = None
+                                current_trans_amount = None
                             # This transaction is complete - save it
-                            if current_trans_desc:
+                            elif current_trans_desc:
                                 trans_desc = clean_transaction_name(' '.join(current_trans_desc).strip())
                                 if trans_desc:
                                     transactions_for_day.append((trans_desc, current_trans_amount))

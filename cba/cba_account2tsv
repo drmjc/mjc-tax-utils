@@ -4,7 +4,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_PYTHON="$REPO_ROOT/cba/venv/bin/python"
+VENV_PYTHON="$REPO_ROOT/venv/bin/python"
 SCRIPT="$REPO_ROOT/cba/cba_account2tsv.py"
 
 exec "$VENV_PYTHON" "$SCRIPT" "$@"

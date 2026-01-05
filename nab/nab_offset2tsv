@@ -1,9 +1,20 @@
 #!/bin/bash
 # Wrapper script for nab_offset2tsv.py
 # Ensures the script runs with the correct virtual environment
-
+#
+# Usage:
+# nab_offset2tsv path/to/Statement.pdf [--out output.tsv] [--debug]
+#
+# Enmasse Usage:
+# parallel --env PATH nab_offset2tsv {} ::: *.pdf
+#
+# See also:
+# nab_offset2tsv.py, the main script
+#
+# Mark Cowley, 2025-12-26
+#
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_PYTHON="${SCRIPT_DIR}/../cba/venv/bin/python"
+VENV_PYTHON="${SCRIPT_DIR}/../venv/bin/python"
 SCRIPT="${SCRIPT_DIR}/nab_offset2tsv.py"
 
 if [ ! -f "$VENV_PYTHON" ]; then
